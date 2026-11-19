@@ -18,6 +18,8 @@ import withRnPrivacy from '../app.plugin.js';
 import * as api from '../dist/index.js';
 import { audit } from '../dist/audit.js';
 import { issuesUrl } from '../dist/scanner.js';
+import { isAppleBinary, scanBinary } from '../dist/binary.js';
+import { suggestFixes, suggestionIssue } from '../dist/suggest.js';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'cli.js');
 const run = (cwd, ...args) => spawnSync(process.execPath, [CLI, ...args], { cwd, encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' } });
@@ -512,6 +514,246 @@ test('check --format json', () => {
   assert.equal(empty.manifests.length, 0);
 });
 
+test('android: library, app, merged manifest and removed permissions', () => {
+  const dir = fixture('android');
+  const manifest = (perms, tools = '') => `<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">\n${perms}\n</manifest>`;
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { 'geo-lib': '1.0.0', 'plain-lib': '1.0.0' } },
+    'node_modules/geo-lib/package.json': { name: 'geo-lib', version: '1.0.0' },
+    'node_modules/geo-lib/android/src/main/AndroidManifest.xml': manifest('<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n<uses-permission android:name="android.permission.INTERNET"/>'),
+    'node_modules/plain-lib/package.json': { name: 'plain-lib', version: '1.0.0' },
+    'android/app/src/main/AndroidManifest.xml': manifest('<uses-permission android:name="android.permission.CAMERA"/>\n<!-- <uses-permission android:name="android.permission.READ_SMS"/> -->\n<uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove"/>'),
+    'android/app/build/intermediates/merged_manifest/release/processReleaseMainManifest/AndroidManifest.xml': manifest('<uses-permission android:name="com.google.android.gms.permission.AD_ID"/>\n<uses-permission android:name="android.permission.RECORD_AUDIO"/>\n<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>'),
+  });
+  const a = analyze(scanProject(dir));
+  const found = Object.fromEntries(a.android.map((p) => [p.permission.split('.').pop(), p.sources]));
+  assert.deepEqual(found, { AD_ID: ['a Gradle dependency'], CAMERA: ['your app'], ACCESS_FINE_LOCATION: ['geo-lib'] }, 'INTERNET is not sensitive, READ_SMS is commented out, RECORD_AUDIO is removed');
+
+  const scan = run(dir, 'scan');
+  assert.match(scan.stdout, /Advertising ID\s+from a Gradle dependency/);
+  assert.match(formatMarkdown(scanProject(dir), a), /### Android permissions/);
+
+  write(dir, { 'app.json': { expo: { android: { blockedPermissions: ['com.google.android.gms.permission.AD_ID'], permissions: ['READ_CONTACTS'] } } } });
+  const b = analyze(scanProject(dir));
+  assert.ok(!b.android.some((p) => p.permission.endsWith('AD_ID')), 'blockedPermissions removes it');
+  assert.ok(b.android.some((p) => p.permission === 'android.permission.READ_CONTACTS'), 'short names from app.json are understood');
+});
+
+test('rules: newly added SDKs are recognized', () => {
+  for (const [pkg, name] of [['clevertap-react-native', 'CleverTap'], ['react-native-moengage', 'MoEngage'], ['@braze/react-native-sdk', 'Braze'], ['react-native-adjust', 'Adjust'], ['singular-react-native', 'Singular'], ['@intercom/intercom-react-native', 'Intercom'], ['@luciq/react-native', 'Luciq (Instabug)'], ['instabug-reactnative', 'Luciq (Instabug)'], ['@logrocket/react-native', 'LogRocket'], ['@microsoft/react-native-clarity', 'Microsoft Clarity'], ['klaviyo-react-native-sdk', 'Klaviyo']]) {
+    const rule = findRule(pkg, '1.0.0');
+    assert.equal(rule?.name, name, pkg);
+    assert.ok(rule.sources.length, `${pkg} has a source`);
+    for (const item of rule.collects ?? []) assert.ok(item.purposes.length, `${pkg} ${item.type} has purposes`);
+  }
+});
+
+test('tracking domains from SDK manifests are normalized to domain names', () => {
+  const dir = fixture('domains');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { 'attr-sdk': '1.0.0' } },
+    'node_modules/attr-sdk/package.json': { name: 'attr-sdk', version: '1.0.0' },
+    'node_modules/attr-sdk/ios/PrivacyInfo.xcprivacy': libManifest('<key>NSPrivacyTracking</key><true/><key>NSPrivacyTrackingDomains</key><array><string>https://Consent.Example.com/path</string><string>t.example.com</string></array>'),
+  });
+  const a = analyze(scanProject(dir));
+  assert.deepEqual(a.tracking[0].domains, ['consent.example.com', 't.example.com']);
+  assert.match(audit(scanProject(dir)).invalid[0].issues[0].message, /must be a domain name only/, 'audit still reports the URL in the SDK');
+});
+
+test('binary: finds required reason APIs in prebuilt frameworks', () => {
+  // A 64-bit Mach-O header followed by a string table, and a static library (ar archive).
+  const macho = Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), Buffer.alloc(28), Buffer.from('\0_mach_absolute_time\0_OBJC_CLASS_$_NSUserDefaults\0_strlen\0', 'latin1')]);
+  const archive = Buffer.from('!<arch>\n...\0_statfs\0activeInputModes\0', 'latin1');
+  const lookalike = Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), Buffer.from('\0_status\0_stat_helper\0', 'latin1')]);
+  const dir = fixture('binary');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { 'bin-sdk': '1.0.0' } },
+    'node_modules/bin-sdk/package.json': { name: 'bin-sdk', version: '1.0.0' },
+    'node_modules/bin-sdk/bin-sdk.podspec': '',
+    'node_modules/bin-sdk/ios/Sdk.xcframework/Info.plist': '<plist/>',
+    // Simulator and macOS slices never ship in an iOS build, so they are skipped.
+    'node_modules/bin-sdk/ios/Sdk.xcframework/ios-arm64_x86_64-simulator/Sdk.framework/Sdk': '\0_stat\0',
+  });
+  const put = (rel, buf) => { fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true }); fs.writeFileSync(path.join(dir, rel), buf); };
+  put('node_modules/bin-sdk/ios/Sdk.xcframework/ios-arm64/Sdk.framework/Sdk', macho);
+  put('node_modules/bin-sdk/ios/libextra.a', archive);
+  put('node_modules/bin-sdk/ios/Sdk.xcframework/ios-arm64/Sdk.framework/Lookalike', lookalike);
+
+  assert.equal(isAppleBinary(path.join(dir, 'node_modules/bin-sdk/ios/libextra.a')), true);
+  assert.equal(isAppleBinary(path.join(dir, 'node_modules/bin-sdk/package.json')), false);
+  assert.deepEqual(scanBinary(path.join(dir, 'node_modules/bin-sdk/ios/Sdk.xcframework/ios-arm64/Sdk.framework/Lookalike')), [], 'exact names only');
+
+  const a = analyze(scanProject(dir));
+  assert.deepEqual(a.apis.map((x) => x.category.replace('NSPrivacyAccessedAPICategory', '')).sort(), ['ActiveKeyboards', 'DiskSpace', 'SystemBootTime', 'UserDefaults'], 'simulator slice (stat) skipped');
+  const lib = audit(scanProject(dir)).undeclared.find((x) => x.pkg === 'bin-sdk');
+  assert.ok(lib, 'binary-only use without a manifest is reported');
+  assert.ok(lib.categories.includes('NSPrivacyAccessedAPICategorySystemBootTime'));
+  const pkg = scanProject(dir).packages.find((p) => p.name === 'bin-sdk');
+  const boot = pkg.apis.get('NSPrivacyAccessedAPICategorySystemBootTime').evidence;
+  assert.deepEqual(boot, [{ kind: 'binary', file: path.join('ios', 'Sdk.xcframework', 'ios-arm64', 'Sdk.framework', 'Sdk'), symbol: 'mach_absolute_time' }]);
+});
+
+test('snapshot and diff, from a file and from a git ref', () => {
+  const dir = fixture('snapshot');
+  const git = (...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: dir, encoding: 'utf8' });
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { storage: '1.0.0' } },
+    'node_modules/storage/package.json': { name: 'storage', version: '1.0.0' },
+    'node_modules/storage/storage.podspec': '',
+    'node_modules/storage/ios/S.swift': 'UserDefaults.standard.set(1, forKey: "k")',
+  });
+  assert.equal(run(dir, 'diff').status, 1, 'no snapshot yet');
+  assert.match(run(dir, 'diff').stderr, /Run `rn-privacy snapshot`/);
+  assert.equal(run(dir, 'snapshot').status, 0);
+  const first = fs.readFileSync(path.join(dir, 'privacy-snapshot.json'), 'utf8');
+  assert.match(run(dir, 'snapshot').stdout, /up to date/, 'stable: no dates or paths');
+  assert.equal(fs.readFileSync(path.join(dir, 'privacy-snapshot.json'), 'utf8'), first);
+  git('init', '-q'); git('add', '.'); git('commit', '-qm', 'base');
+
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { storage: '1.1.0', 'fs-lib': '2.0.0' } },
+    'node_modules/storage/package.json': { name: 'storage', version: '1.1.0' },
+    'node_modules/fs-lib/package.json': { name: 'fs-lib', version: '2.0.0' },
+    'node_modules/fs-lib/fs-lib.podspec': '',
+    'node_modules/fs-lib/ios/F.m': 'NSDictionary *a = x[NSFileSystemFreeSize];',
+    'node_modules/fs-lib/android/src/main/AndroidManifest.xml': '<manifest><uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/></manifest>',
+  });
+  const diff = run(dir, 'diff');
+  assert.equal(diff.status, 0);
+  assert.match(diff.stdout, /\+ Disk space\s+fs-lib/);
+  assert.match(diff.stdout, /\+ Photos\s+fs-lib/);
+  assert.match(diff.stdout, /~ storage\s+1\.0\.0 → 1\.1\.0/);
+  assert.equal(run(dir, 'diff', '--strict').status, 1);
+
+  const json = JSON.parse(run(dir, 'diff', '--base', 'HEAD', '--format', 'json').stdout);
+  assert.equal(json.against, 'HEAD:privacy-snapshot.json');
+  assert.deepEqual(json.apis, [{ kind: 'added', label: 'Disk space', detail: 'fs-lib' }]);
+
+  run(dir, 'snapshot');
+  assert.match(run(dir, 'diff').stdout, /No privacy changes/);
+  assert.equal(run(dir, 'diff', '--base', 'no-such-ref').status, 1);
+});
+
+test('package layouts: pnpm symlinks, workspaces, Yarn Plug\'n\'Play', () => {
+  // pnpm: node_modules/<pkg> is a symlink into .pnpm, and its dependencies are siblings there.
+  const pnpm = fixture('pnpm');
+  const store = 'node_modules/.pnpm';
+  write(pnpm, {
+    'package.json': { name: 'App', dependencies: { expo: '54.0.0' } },
+    [`${store}/expo@54.0.0/node_modules/expo/package.json`]: { name: 'expo', version: '54.0.0', dependencies: { 'expo-file-system': '19.0.0' } },
+    [`${store}/expo-file-system@19.0.0/node_modules/expo-file-system/package.json`]: { name: 'expo-file-system', version: '19.0.0' },
+    [`${store}/expo-file-system@19.0.0/node_modules/expo-file-system/expo-module.config.json`]: { platforms: ['apple'] },
+    [`${store}/expo-file-system@19.0.0/node_modules/expo-file-system/ios/F.swift`]: 'let k: URLResourceKey = .volumeAvailableCapacityKey',
+  });
+  fs.symlinkSync(path.join(pnpm, store, 'expo@54.0.0/node_modules/expo'), path.join(pnpm, 'node_modules/expo'), 'dir');
+  fs.symlinkSync(path.join(pnpm, store, 'expo-file-system@19.0.0/node_modules/expo-file-system'), path.join(pnpm, store, 'expo@54.0.0/node_modules/expo-file-system'), 'dir');
+  const a = analyze(scanProject(pnpm));
+  assert.deepEqual(a.apis.map((x) => [x.category, x.packages]), [['NSPrivacyAccessedAPICategoryDiskSpace', ['expo-file-system']]], 'transitive module found through the pnpm store');
+
+  // npm/yarn workspaces: dependencies hoisted to the monorepo root.
+  const mono = fixture('mono');
+  write(mono, {
+    'package.json': { name: 'mono', private: true, workspaces: ['apps/*'] },
+    'apps/mobile/package.json': { name: 'mobile', dependencies: { 'fs-lib': '1.0.0' } },
+    'node_modules/fs-lib/package.json': { name: 'fs-lib', version: '1.0.0' },
+    'node_modules/fs-lib/fs-lib.podspec': '',
+    'node_modules/fs-lib/ios/F.m': 'NSDictionary *a = x[NSFileSystemFreeSize];',
+  });
+  const m = analyze(scanProject(path.join(mono, 'apps/mobile')));
+  assert.deepEqual(m.apis.map((x) => x.packages), [['fs-lib']]);
+  assert.equal(m.warnings.length, 0);
+
+  // Yarn Plug'n'Play: one clear message instead of "not installed" for every package.
+  const pnp = fixture('pnp');
+  write(pnp, { 'package.json': { name: 'App', dependencies: { a: '1', b: '1' } }, '.pnp.cjs': '' });
+  const w = analyze(scanProject(pnp)).warnings;
+  assert.equal(w.length, 1);
+  assert.match(w[0].message, /nodeLinker: node-modules/);
+});
+
+test('audit --suggest: valid fixed manifests and issue texts, nothing guessed', () => {
+  const dir = fixture('suggest');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { '@segment/analytics-react-native': '2.0.0', 'fs-lib': '1.0.0', 'partial': '1.0.0' } },
+    // Like Segment's real manifest: an empty purpose and a made-up data type.
+    'node_modules/@segment/analytics-react-native/package.json': { name: '@segment/analytics-react-native', version: '2.0.0', repository: 'github:segmentio/analytics-react-native' },
+    'node_modules/@segment/analytics-react-native/ios/PrivacyInfo.xcprivacy': libManifest('<key>NSPrivacyTrackingDomains</key><array><string>https://t.example.com/x</string></array><key>NSPrivacyCollectedDataTypes</key><array><dict><key>NSPrivacyCollectedDataType</key><string>NSPrivacyCollectedDataTypeDeviceID</string><key>NSPrivacyCollectedDataTypeLinked</key><true/><key>NSPrivacyCollectedDataTypeTracking</key><false/><key>NSPrivacyCollectedDataTypePurposes</key><array><string></string></array></dict><dict><key>NSPrivacyCollectedDataType</key><string>App Name</string><key>NSPrivacyCollectedDataTypeLinked</key><false/><key>NSPrivacyCollectedDataTypeTracking</key><false/><key>NSPrivacyCollectedDataTypePurposes</key><array><string>NSPrivacyCollectedDataTypePurposeAnalytics</string></array></dict></array>'),
+    'node_modules/fs-lib/package.json': { name: 'fs-lib', version: '1.0.0' },
+    'node_modules/fs-lib/fs-lib.podspec': '',
+    'node_modules/fs-lib/ios/F.m': 'NSDictionary *a = x[NSFileSystemFreeSize];',
+    'node_modules/partial/package.json': { name: 'partial', version: '1.0.0' },
+    'node_modules/partial/ios/P.swift': 'let t = ProcessInfo.processInfo.systemUptime',
+    'node_modules/partial/ios/PrivacyInfo.xcprivacy': manifestXml([['NSPrivacyAccessedAPICategoryUserDefaults', 'NOPE.1']]),
+  });
+  const sugs = Object.fromEntries(suggestFixes(scanProject(dir)).map((x) => [x.pkg, x]));
+  assert.deepEqual(Object.keys(sugs).sort(), ['@segment/analytics-react-native', 'fs-lib', 'partial']);
+  for (const sug of Object.values(sugs)) {
+    assert.deepEqual(validateManifest(sug.manifest, { sdk: true }).filter((p) => p.level === 'error'), [], `${sug.pkg} suggestion is valid`);
+  }
+  const seg = sugs['@segment/analytics-react-native'];
+  assert.deepEqual(seg.manifest.NSPrivacyCollectedDataTypes.map((d) => d.NSPrivacyCollectedDataType), ['NSPrivacyCollectedDataTypeDeviceID'], '"App Name" removed');
+  assert.ok(seg.manifest.NSPrivacyCollectedDataTypes[0].NSPrivacyCollectedDataTypePurposes.length, 'purpose filled from the rule');
+  assert.ok(seg.decide.some((d) => d.includes('confirm the purposes')), 'and the maintainer is asked to confirm');
+  assert.deepEqual(seg.manifest.NSPrivacyTrackingDomains, ['t.example.com']);
+  assert.deepEqual(sugs['fs-lib'].manifest.NSPrivacyAccessedAPITypes, [{ NSPrivacyAccessedAPIType: 'NSPrivacyAccessedAPICategoryDiskSpace', NSPrivacyAccessedAPITypeReasons: ['E174.1'] }]);
+  const partial = sugs.partial.manifest.NSPrivacyAccessedAPITypes.map((t) => [t.NSPrivacyAccessedAPIType.replace('NSPrivacyAccessedAPICategory', ''), t.NSPrivacyAccessedAPITypeReasons]);
+  assert.deepEqual(partial, [['UserDefaults', ['CA92.1']], ['SystemBootTime', ['35F9.1']]], 'invalid reason replaced (to decide), missing category added');
+
+  const issue = suggestionIssue(seg);
+  assert.match(issue.title, /needs a fix/);
+  assert.match(issue.body, /"App Name" is not a valid collected data type/);
+  assert.match(issue.body, /```xml\n<\?xml/);
+  assert.match(suggestionIssue(sugs['fs-lib']).title, /Add an iOS privacy manifest/);
+
+  const out = run(dir, 'audit', '--suggest', '-o', 'fixes');
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /post at https:\/\/github.com\/segmentio\/analytics-react-native\/issues/);
+  assert.ok(fs.existsSync(path.join(dir, 'fixes/segment-analytics-react-native/PrivacyInfo.xcprivacy')));
+  assert.ok(fs.existsSync(path.join(dir, 'fixes/fs-lib/ISSUE.md')));
+});
+
+test('android: Play answers come from vendors\' Play disclosures, else from iOS (marked)', () => {
+  const dir = fixture('play-android');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { 'react-native-google-mobile-ads': '14.0.0', '@sentry/react-native': '6.0.0', '@braze/react-native-sdk': '24.0.0', 'react-native-onesignal': '5.0.0' } },
+    'node_modules/react-native-google-mobile-ads/package.json': { name: 'react-native-google-mobile-ads', version: '14.0.0' },
+    'node_modules/@sentry/react-native/package.json': { name: '@sentry/react-native', version: '6.0.0' },
+    'node_modules/@braze/react-native-sdk/package.json': { name: '@braze/react-native-sdk', version: '24.0.0' },
+    'node_modules/react-native-onesignal/package.json': { name: 'react-native-onesignal', version: '5.0.0' },
+  });
+  const a = analyze(scanProject(dir));
+  const byType = Object.fromEntries(a.play.map((f) => [f.type, f]));
+  // AdMob's Play page: shared, with fraud prevention (a purpose Apple does not have).
+  assert.equal(byType['coarse-location'].shared, true);
+  assert.ok(byType['coarse-location'].purposes.includes('fraud-prevention'));
+  // OneSignal's Play page adds Developer communications; its device ID is iOS-only.
+  assert.ok(byType['product-interaction'].purposes.includes('developer-communications'));
+  // Sentry publishes no Play page: derived from iOS and marked.
+  assert.ok(byType['crash-data'].derived.includes('@sentry/react-native'));
+  assert.ok(!byType['device-id'].derived.includes('react-native-google-mobile-ads'));
+  // Sharing purposes only come from the SDKs that share.
+  assert.deepEqual(byType['device-id'].sharedPurposes.sort(), ['advertising', 'analytics', 'fraud-prevention']);
+
+  const md = formatMarkdown(scanProject(dir), a);
+  assert.match(md, /\| Shared \|/);
+  assert.match(md, /@sentry\/react-native†/);
+  assert.match(md, /comes from the iOS data/);
+
+  // Braze states no purposes: play leaves them to the developer.
+  const csv = [PLAY_HEADER, ...playRows('PSL_CRASH_LOGS')].join('\n') + '\n';
+  const res = fillPlayCsv(csv, [{ type: 'crash-data', purposes: [] }]);
+  assert.deepEqual(res.purposeTodo, ['Crash logs']);
+  const shared = fillPlayCsv([PLAY_HEADER, ...playRows('PSL_CRASH_LOGS'),
+    'PSL_DATA_USAGE_RESPONSES:PSL_CRASH_LOGS:DATA_USAGE_SHARING_PURPOSE,PSL_ANALYTICS,,MULTIPLE_CHOICE,Shared analytics',
+    'PSL_DATA_USAGE_RESPONSES:PSL_CRASH_LOGS:DATA_USAGE_SHARING_PURPOSE,PSL_APP_FUNCTIONALITY,,MULTIPLE_CHOICE,Shared functionality'].join('\n') + '\n',
+    [{ type: 'crash-data', purposes: ['analytics', 'app-functionality'], shared: true, sharedPurposes: ['analytics'] }]);
+  const rows = parseCsv(shared.content);
+  const v = (q, r) => rows.find((x) => x[0] === q && x[1] === r)?.[2];
+  assert.equal(v('PSL_DATA_USAGE_RESPONSES:PSL_CRASH_LOGS:PSL_DATA_USAGE_COLLECTION_AND_SHARING', 'PSL_DATA_USAGE_ONLY_SHARED'), 'true');
+  assert.equal(v('PSL_DATA_USAGE_RESPONSES:PSL_CRASH_LOGS:DATA_USAGE_SHARING_PURPOSE', 'PSL_ANALYTICS'), 'true');
+  assert.equal(v('PSL_DATA_USAGE_RESPONSES:PSL_CRASH_LOGS:DATA_USAGE_SHARING_PURPOSE', 'PSL_APP_FUNCTIONALITY'), '', 'only the sharing SDK\'s purposes');
+});
+
 test('issuesUrl understands the usual package.json forms', () => {
   assert.equal(issuesUrl({ bugs: 'https://x.dev/bugs' }), 'https://x.dev/bugs');
   assert.equal(issuesUrl({ bugs: { url: 'https://x.dev/b' } }), 'https://x.dev/b');
@@ -533,4 +775,289 @@ test('public API works from ESM imports', () => {
 test('--help and unknown command', () => {
   assert.match(execFileSync(process.execPath, [CLI, '--help'], { encoding: 'utf8' }), /Commands/);
   assert.equal(run(os.tmpdir(), 'nope').status, 2);
+});
+
+test('config: your own rules for unknown SDKs, pods and the app itself, replacing built-in ones', () => {
+  const dir = fixture('config');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { '@acme/tracker': '1.0.0', '@sentry/react-native': '6.0.0' } },
+    'node_modules/@acme/tracker/package.json': { name: '@acme/tracker', version: '2.1.0' },
+    'node_modules/@sentry/react-native/package.json': { name: '@sentry/react-native', version: '6.0.0' },
+    'ios/Pods/AcmeKit/AcmeKit.m': '',
+    'rn-privacy.config.json': {
+      $schema: './node_modules/rn-privacy/config.schema.json',
+      rules: [
+        { packages: ['@acme/tracker'], name: 'Acme Tracker', collects: [{ type: 'device-id', purposes: ['analytics'], linked: false, tracking: false }],
+          android: { collects: [{ type: 'device-id', purposes: ['analytics'], shared: true }] }, sources: ['https://acme.example/privacy'] },
+        { packages: ['@sentry/react-native'], name: 'Sentry (our setup)', collects: [] },
+        { packages: ['AcmeKit'], name: 'AcmeKit', collects: [{ type: 'precise-location', purposes: ['app-functionality'], linked: true, tracking: false }] },
+        { name: 'Sign-in', collects: [{ type: 'email', purposes: ['app-functionality'], linked: true, tracking: false }],
+          android: { collects: [{ type: 'email', purposes: ['account-management'] }] } },
+        { packages: ['not-installed'], name: 'Typo', collects: [] },
+      ],
+    },
+  });
+  const scan = scanProject(dir);
+  const a = analyze(scan);
+  const types = a.data.map((d) => d.type).sort();
+  assert.deepEqual(types, ['device-id', 'email', 'precise-location'], 'Sentry\'s built-in rule is replaced');
+  assert.deepEqual(a.data.find((d) => d.type === 'precise-location').packages, ['AcmeKit (CocoaPods)']);
+  // A pod is not in the Android app; the app rule and the npm SDK are.
+  assert.deepEqual(a.play.map((p) => p.type).sort(), ['device-id', 'email']);
+  assert.equal(a.play.find((p) => p.type === 'device-id').shared, true);
+  assert.deepEqual(a.play.find((p) => p.type === 'email').purposes, ['account-management']);
+  assert.ok(a.warnings.some((w) => w.pkg === 'Typo' && /matches no installed package/.test(w.message)));
+  const md = formatMarkdown(scan, a);
+  assert.match(md, /\*\*Acme Tracker|@acme\/tracker@2\.1\.0\*\* \(your rule in rn-privacy\.config\.json\)/);
+  assert.match(md, /\*\*Sign-in\*\* \(your rule in rn-privacy\.config\.json\)/);
+  assert.match(run(dir, 'scan').stdout, /using your rules/);
+});
+
+test('config: every problem is reported with a fix, and the command fails', () => {
+  const dir = fixture('config-bad');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: {} },
+    'rn-privacy.config.json': {
+      rule: [],
+      rules: [
+        { name: 'A', collects: [{ type: 'emial', purposes: ['ads'], linked: true }] },
+        { packages: [], name: 'B', versions: '>=1 <<2', collect: [] },
+        { packages: ['c'], name: 'C', android: { collects: [{ type: 'email', purposes: ['analytic'] }] } },
+      ],
+    },
+  });
+  const r = run(dir, 'scan');
+  assert.equal(r.status, 1);
+  for (const msg of [
+    /Unknown setting "rule"/,
+    /"emial" is not a data type/,
+    /"ads" is not a purpose/,
+    /"tracking" must be true or false/,
+    /"packages" must be a non-empty list/,
+    /unknown field "collect"/,
+    /"analytic" is not a Google Play purpose/,
+  ]) assert.match(r.stderr, msg);
+  assert.throws(() => api.parseConfig({ rules: [{ name: 'x', collects: [], versions: '^1' }] }), /"versions" only works with "packages"/);
+  write(dir, { 'rn-privacy.config.json': '{ nope' });
+  assert.match(run(dir, 'scan').stderr, /Not valid JSON/);
+});
+
+test('config schema lists the same data types and purposes as the code', () => {
+  const schema = JSON.parse(fs.readFileSync(new URL('../config.schema.json', import.meta.url), 'utf8'));
+  const d = schema.$defs;
+  assert.deepEqual(d.dataType.enum.sort(), Object.keys(api.DATA_TYPES).sort());
+  assert.deepEqual(d.purpose.enum.sort(), Object.keys(api.PURPOSES).sort());
+  assert.deepEqual(d.playPurpose.enum.sort(), Object.keys(api.PLAY_PURPOSES).sort());
+});
+
+const resolvedV2 = (pins) => JSON.stringify({ pins: pins.map(([identity, location, version]) => ({ identity, kind: 'remoteSourceControl', location, state: { revision: 'abcdef1234567', version } })), version: 2 });
+
+test('swift packages: Package.resolved, checkouts, binary artifacts and DerivedData', () => {
+  const dir = fixture('spm');
+  const dd = fixture('spm-dd');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: {} },
+    'ios/App.xcworkspace/xcshareddata/swiftpm/Package.resolved': resolvedV2([
+      ['sdkkit', 'https://github.com/acme/SDKKit.git', '3.2.1'],
+      ['binarysdk', 'https://github.com/acme/BinarySDK', '1.0.0'],
+      ['plain', 'https://github.com/acme/plain.git', '0.1.0'],
+    ]),
+  });
+  const sp = path.join(dd, 'App-xyz', 'SourcePackages');
+  write(sp, {
+    'checkouts/SDKKit/Sources/SDKKit/PrivacyInfo.xcprivacy': libManifest(
+      '<key>NSPrivacyTracking</key><true/><key>NSPrivacyTrackingDomains</key><array><string>https://t.acme.example/x</string></array>',
+    ),
+    'checkouts/SDKKit/Sources/SDKKit/Store.swift': 'UserDefaults.standard.set(1, forKey: "k")',
+    'checkouts/SDKKit/Tests/SDKKitTests/T.swift': 'mach_absolute_time()',
+    'checkouts/BinarySDK/Package.swift': '// swift-tools-version:5.9',
+    'checkouts/plain/Sources/Plain/P.swift': 'let x = 1',
+  });
+  const bin = path.join(sp, 'artifacts/binarysdk/BinarySDK/BinarySDK.xcframework/ios-arm64/BinarySDK.framework/BinarySDK');
+  fs.mkdirSync(path.dirname(bin), { recursive: true });
+  fs.writeFileSync(bin, Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), Buffer.alloc(60), Buffer.from('\0_mach_absolute_time\0')]));
+  write(dd, {
+    'App-xyz/info.plist': `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>WorkspacePath</key><string>${path.join(dir, 'ios', 'App.xcworkspace')}</string></dict></plist>`,
+  });
+  const env = { ...process.env, RN_PRIVACY_DERIVED_DATA: dd };
+  const old = process.env.RN_PRIVACY_DERIVED_DATA;
+  process.env.RN_PRIVACY_DERIVED_DATA = dd;
+  try {
+    const scan = scanProject(dir);
+    const names = scan.packages.map((p) => `${p.name}@${p.version}`);
+    assert.deepEqual(names.sort(), ['BinarySDK (Swift Package)@1.0.0', 'SDKKit (Swift Package)@3.2.1'], 'a package with nothing to declare is left out');
+    const kit = scan.packages.find((p) => p.name.startsWith('SDKKit'));
+    assert.deepEqual([...kit.apis.keys()], ['NSPrivacyAccessedAPICategoryUserDefaults'], 'tests are not scanned');
+    assert.deepEqual(kit.trackingDomains, ['t.acme.example']);
+    assert.equal(kit.issuesUrl, 'https://github.com/acme/SDKKit/issues');
+    const binary = scan.packages.find((p) => p.name.startsWith('BinarySDK'));
+    assert.equal(binary.apis.get('NSPrivacyAccessedAPICategorySystemBootTime').evidence[0].kind, 'binary');
+    const a = analyze(scan);
+    assert.deepEqual(a.play, [], 'Swift packages are not in the Android app');
+    assert.ok(audit(scan).undeclared.some((r) => r.pkg === 'BinarySDK (Swift Package)'));
+    assert.deepEqual(scan.swiftPackagesNotDownloaded, []);
+  } finally {
+    if (old === undefined) delete process.env.RN_PRIVACY_DERIVED_DATA;
+    else process.env.RN_PRIVACY_DERIVED_DATA = old;
+  }
+
+  // Not downloaded yet: say so instead of reporting nothing.
+  const r = spawnSync(process.execPath, [CLI, 'scan'], { cwd: dir, encoding: 'utf8', env: { ...env, NO_COLOR: '1', RN_PRIVACY_DERIVED_DATA: path.join(dd, 'nothing') } });
+  assert.match(r.stdout, /3 Swift packages are listed in Package\.resolved but not downloaded/);
+
+  // A folder from -clonedSourcePackagesDirPath wins, and format 1 of Package.resolved works too.
+  fs.rmSync(path.join(dir, 'ios/App.xcworkspace'), { recursive: true });
+  write(dir, {
+    'ios/App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved': JSON.stringify({
+      object: { pins: [{ package: 'SDKKit', repositoryURL: 'https://github.com/acme/SDKKit.git', state: { version: '3.0.0' } }] }, version: 1,
+    }),
+  });
+  fs.cpSync(path.join(sp, 'checkouts'), path.join(dir, 'ios/SourcePackages/checkouts'), { recursive: true });
+  const local = spawnSync(process.execPath, [CLI, 'scan', '--format', 'json'], { cwd: dir, encoding: 'utf8', env: { ...env, RN_PRIVACY_DERIVED_DATA: path.join(dd, 'nothing') } });
+  assert.deepEqual(JSON.parse(local.stdout).packages.map((p) => `${p.name}@${p.version}`), ['SDKKit (Swift Package)@3.0.0']);
+});
+
+test('swift packages: names from the Xcode project when Package.resolved is missing', () => {
+  const pins = api.pbxprojPackages(`
+    A1 /* XCRemoteSwiftPackageReference "Kit" */ = {
+      isa = XCRemoteSwiftPackageReference;
+      repositoryURL = "https://github.com/acme/Kit.git";
+    };`);
+  assert.deepEqual(pins, [{ identity: 'kit', name: 'Kit', location: 'https://github.com/acme/Kit.git', version: '?' }]);
+  assert.deepEqual(api.parsePackageResolved('not json'), []);
+});
+
+test('rules: Play disclosures for BugSnag, Clarity, Singular and Luciq', () => {
+  for (const pkg of ['@bugsnag/react-native', '@microsoft/react-native-clarity', 'singular-react-native', '@luciq/react-native']) {
+    const rule = findRule(pkg);
+    assert.ok(rule.android?.collects.length, pkg);
+    assert.ok(rule.android.sources.every((s) => s.startsWith('https://')), pkg);
+  }
+});
+
+test('init: plans, writes once, and never overwrites', () => {
+  const dir = fixture('init');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { expo: '52.0.0', '@sentry/react-native': '6.0.0' } },
+    'package-lock.json': '{}',
+    'app.json': { expo: { name: 'App', plugins: ['expo-router'] } },
+    'node_modules/@sentry/react-native/package.json': { name: '@sentry/react-native', version: '6.0.0' },
+    'node_modules/expo/package.json': { name: 'expo', version: '52.0.0' },
+  });
+  fs.mkdirSync(path.join(dir, '.git'));
+  const dry = run(dir, 'init');
+  assert.equal(dry.status, 0);
+  assert.match(dry.stdout, /Dry run/);
+  assert.ok(!fs.existsSync(path.join(dir, 'rn-privacy.config.json')), 'dry run writes nothing');
+
+  const r = run(dir, 'init', '--write');
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'app.json'), 'utf8')).expo.plugins, ['expo-router', 'rn-privacy']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'rn-privacy.config.json'), 'utf8')).rules, []);
+  assert.ok(fs.existsSync(path.join(dir, 'privacy-snapshot.json')));
+  const wf = fs.readFileSync(path.join(dir, '.github/workflows/privacy.yml'), 'utf8');
+  assert.match(wf, /pull-requests: write/);
+  assert.match(wf, /- run: npm ci/);
+  assert.match(wf, /uses: yogesh2902\/rn-privacy@v\d+\.\d+\.\d+/);
+  assert.match(r.stdout, /npm install --save-dev rn-privacy/, 'the Expo plugin needs the package installed');
+  assert.equal(run(dir, 'check').status, 0, 'check passes right after init');
+
+  // Second run: everything done, nothing changed.
+  fs.writeFileSync(path.join(dir, 'rn-privacy.config.json'), '{ "rules": [] }\n');
+  const again = run(dir, 'init', '--write');
+  assert.match(again.stdout, /Already set up/);
+  assert.equal(fs.readFileSync(path.join(dir, 'rn-privacy.config.json'), 'utf8'), '{ "rules": [] }\n');
+});
+
+test('init: bare app in a pnpm monorepo', () => {
+  const repo = fixture('init-mono');
+  const app = path.join(repo, 'apps', 'mobile');
+  write(repo, { 'pnpm-lock.yaml': '', 'package.json': { name: 'root', private: true } });
+  write(app, {
+    'package.json': { name: 'mobile', dependencies: { 'react-native': '0.76.0', 'native-lib': '1.0.0' } },
+    'node_modules/native-lib/package.json': { name: 'native-lib', version: '1.0.0' },
+    'node_modules/native-lib/native-lib.podspec': '',
+    'node_modules/native-lib/ios/A.m': '[NSUserDefaults standardUserDefaults];',
+    'ios/Mobile.xcodeproj/project.pbxproj': '',
+    'ios/Mobile/AppDelegate.mm': '',
+  });
+  fs.mkdirSync(path.join(repo, '.git'));
+  const r = run(app, 'init', '--write');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(fs.readFileSync(path.join(app, 'ios/Mobile/PrivacyInfo.xcprivacy'), 'utf8'), /CA92\.1/);
+  assert.match(r.stdout, /add ios\/Mobile\/PrivacyInfo\.xcprivacy to your app target/);
+  const wf = fs.readFileSync(path.join(repo, '.github/workflows/privacy.yml'), 'utf8');
+  assert.match(wf, /pnpm\/action-setup/);
+  assert.match(wf, /pnpm install --frozen-lockfile/);
+  assert.match(wf, /project-path: apps\/mobile/);
+  assert.doesNotMatch(wf, /working-directory/, 'pnpm installs from the repository root');
+});
+
+const ascFixture = () => {
+  const dir = fixture('asc');
+  write(dir, {
+    'package.json': { name: 'App', dependencies: { '@segment/analytics-react-native': '2.21.0', 'react-native-branch': '6.0.0', '@sentry/react-native': '6.0.0' } },
+    'node_modules/@segment/analytics-react-native/package.json': { name: '@segment/analytics-react-native', version: '2.21.0' },
+    'node_modules/react-native-branch/package.json': { name: 'react-native-branch', version: '6.0.0' },
+    'node_modules/@sentry/react-native/package.json': { name: '@sentry/react-native', version: '6.0.0' },
+    'rn-privacy.config.json': { rules: [{ name: 'Sign-in', collects: [{ type: 'email', purposes: ['app-functionality'], linked: true, tracking: false }] }] },
+  });
+  return dir;
+};
+
+test('report --format appstore: App Store Connect answers in order, with who makes each Yes', () => {
+  const dir = ascFixture();
+  const r = run(dir, 'report', '--format', 'appstore');
+  assert.equal(r.status, 0, r.stderr);
+  const md = r.stdout;
+  assert.match(md, /collect data from this app\?" \*\*Yes\*\*/);
+  assert.match(md, /- \*\*Contact Info\*\*: Email Address/);
+  assert.match(md, /- \*\*Identifiers\*\*: Device ID/);
+  assert.ok(md.indexOf('### Email Address') < md.indexOf('### Device ID'), 'App Store Connect order');
+  const device = md.slice(md.indexOf('### Device ID'), md.indexOf('###', md.indexOf('### Device ID') + 4));
+  // Segment links device IDs but does not track; Branch does both.
+  assert.match(device, /Linked to the user's identity\? \*\*Yes\*\* \(because of @segment\/analytics-react-native, react-native-branch\)/);
+  assert.match(device, /Used for tracking\? \*\*Yes\*\* \(because of react-native-branch\)/);
+  assert.match(md, /## Only if you use these features[\s\S]*User ID/);
+  assert.match(md, /App Tracking Transparency/);
+  const all = run(dir, 'report', '-f', 'appstore', '--include-conditional').stdout;
+  assert.match(all, /### User ID/);
+  assert.doesNotMatch(all, /## Only if you use these features/);
+  assert.equal(run(dir, 'report', '-f', 'nope').status, 2);
+});
+
+test('report --format inventory: data, services and purposes in plain words', () => {
+  const md = run(ascFixture(), 'report', '--format', 'inventory').stdout;
+  assert.match(md, /^# Data inventory/);
+  assert.match(md, /\| Email address \| App features \| Sign-in \| iOS, Android \| Yes \| No \| No \|/);
+  assert.match(md, /\| Segment \| `@segment\/analytics-react-native` \|/);
+  assert.match(md, /## Collected by your own app[\s\S]*\*\*Sign-in\*\*: Email address/);
+  assert.doesNotMatch(md, /\| Sign-in \| `/, 'the app itself is not a third party');
+  assert.doesNotMatch(md, /Third-party advertising|Advertising or marketing/, 'one set of purpose words');
+});
+
+test('rule freshness: manifest summaries, tarballs and changes', async () => {
+  const fresh = await import('../scripts/rule-freshness.mjs');
+  const xml = libManifest('<key>NSPrivacyTracking</key><true/><key>NSPrivacyTrackingDomains</key><array><string>b.example</string><string>a.example</string></array>');
+  const s = fresh.summarizeManifest(xml);
+  assert.deepEqual(s, { tracking: true, domains: ['a.example', 'b.example'], collected: [] });
+  assert.deepEqual(fresh.summarizeManifest('nope'), { invalid: true });
+  assert.equal(fresh.rawGithubUrl('https://github.com/a/b/blob/main/x/PrivacyInfo.xcprivacy'), 'https://raw.githubusercontent.com/a/b/main/x/PrivacyInfo.xcprivacy');
+
+  const dir = fixture('tgz');
+  write(dir, { 'package/ios/PrivacyInfo.xcprivacy': xml, 'package/index.js': '' });
+  execFileSync('tar', ['-czf', 'pkg.tgz', 'package'], { cwd: dir });
+  const files = fresh.readTarGz(fs.readFileSync(path.join(dir, 'pkg.tgz')), (n) => path.basename(n) === 'PrivacyInfo.xcprivacy');
+  assert.deepEqual(Object.keys(files), ['ios/PrivacyInfo.xcprivacy']);
+
+  const base = { manifests: { k: { rule: 'X', source: 'npm:x', version: '1.0.0', summary: s } } };
+  assert.deepEqual(fresh.compare(base, { manifests: { k: { ...base.manifests.k } }, checked: ['npm:x'] }), []);
+  const changed = fresh.compare(base, { manifests: { k: { rule: 'X', source: 'npm:x', version: '2.0.0', summary: { ...s, domains: ['a.example'], tracking: false } } }, checked: ['npm:x'] });
+  assert.equal(changed.length, 1);
+  assert.match(changed[0].text, /NSPrivacyTracking: true → false/);
+  assert.match(changed[0].text, /- tracking domain b\.example/);
+  assert.deepEqual(fresh.compare(base, { manifests: {}, checked: ['npm:x'] }).map((c) => c.kind), ['removed']);
+  assert.deepEqual(fresh.compare(base, { manifests: {}, checked: [] }), [], 'a failed download is not a removal');
+  const baseline = JSON.parse(fs.readFileSync(fresh.BASELINE, 'utf8'));
+  assert.ok(Object.keys(baseline.manifests).length >= 10, 'the committed baseline covers the vendor manifests');
 });

@@ -2,17 +2,24 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { analyze, toApiUsages, toCollected, trackingDomains } from './analyze.js';
+import { analyze, toApiUsages, toCollected, toPlayCollected, trackingDomains } from './analyze.js';
 import { audit, auditProblemCount } from './audit.js';
 import { expoSnippet, expoWriteTarget, findExpoConfig, findIosManifest, planExpoAppJson, planIosManifest } from './ios.js';
 import { readManifest } from './manifest.js';
 import { fillPlayCsv } from './play.js';
 import { validateManifest } from './validate.js';
 import { formatCheck, readExpoPrivacy, runCheck } from './check.js';
+import { AD_ID } from './android.js';
+import { suggestFixes, suggestionIssue, suggestionManifest } from './suggest.js';
+import { buildSnapshot, changeCount, diffSnapshots, formatDiff, loadBaseSnapshot, SNAPSHOT_FILE, snapshotText } from './snapshot.js';
 import { c, formatAudit, formatMarkdown, formatScan, toJson } from './report.js';
 import { scanProject } from './scanner.js';
+import { applyInit, planInit } from './init.js';
+import { formatAppStore } from './appstore.js';
+import { formatInventory } from './inventory.js';
 
-const VERSION = '0.3.0';
+// Read from package.json so a release only needs one version bump.
+const VERSION: string = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
 
 const HELP = `${c.bold('rn-privacy')} ${VERSION}
 Privacy manifest and store privacy forms for React Native and Expo apps.
@@ -21,27 +28,35 @@ ${c.bold('Usage')}
   rn-privacy [command] [options]
 
 ${c.bold('Commands')}
+  init      Set up a project: Expo plugin or privacy manifest, your rules file, snapshot, GitHub workflow
   scan      Show what your dependencies collect and which Apple APIs they use (default)
   ios       Update your PrivacyInfo.xcprivacy (bare) or app.json (Expo). Dry run unless --write
   report    Answers for App Store Connect "App Privacy" and Google Play "Data safety"
   play      Fill in the Data safety CSV exported from Play Console: rn-privacy play data_safety.csv -o filled.csv
   check     For CI: exit with code 1 if your manifest is missing or invalid
   audit     Check the privacy manifests your libraries ship, and where to report problems
+  snapshot  Save what your dependencies need to privacy-snapshot.json (commit it)
+  diff      Show privacy changes since the snapshot: new APIs, data, tracking, permissions
 
 ${c.bold('Options')}
   -p, --project <dir>       App folder (default: current folder)
-  -w, --write               (ios) Write the changes instead of only showing them
-      --include-conditional (ios, play) Also declare data collected only in some setups
+  -w, --write               (init, ios) Write the changes instead of only showing them
+      --include-conditional (ios, play, report -f appstore) Also declare data collected only in some setups
       --tracking            (ios) Your app tracks users: set NSPrivacyTracking and add your libraries' tracking domains
-      --strict              (audit) Exit with code 1 when a library has a problem
-  -f, --format <md|json>    (report, scan, audit, check) Output format (default: md for report)
-  -o, --out <file>          (report, play) Write to a file instead of the terminal
+      --strict              (audit, diff) Exit with code 1 when there is a problem or a change
+      --suggest             (audit) Write a fixed PrivacyInfo.xcprivacy and an issue text for each library
+      --base <file|ref>     (diff) Snapshot to compare with: a file, or a git ref such as origin/main
+  -f, --format <format>     md or json (report, scan, audit, check, diff). For report also:
+                              appstore   App Store Connect answers, step by step
+                              inventory  what is collected, by whom and why, for your privacy policy
+  -o, --out <file>          (report, play, snapshot) Write to a file instead of the terminal; (audit --suggest) folder
   -h, --help                Show this help
   -v, --version             Show the version
 
 ${c.bold('Also')}
   Expo plugin    Add "plugins": ["rn-privacy"] to app.json to update the manifest on every prebuild
-  GitHub Action  uses: yogesh2902/rn-privacy@v0.3.0 checks every pull request
+  GitHub Action  uses: yogesh2902/rn-privacy@v0.4.0 checks every pull request
+  Your rules     rn-privacy.config.json describes in-house SDKs and data your app collects
   Docs           https://github.com/yogesh2902/rn-privacy
 `;
 
@@ -54,7 +69,9 @@ function main(argv: string[]): number {
       write: { type: 'boolean', short: 'w' },
       'include-conditional': { type: 'boolean' },
       tracking: { type: 'boolean' },
+      suggest: { type: 'boolean' },
       strict: { type: 'boolean' },
+      base: { type: 'string' },
       format: { type: 'string', short: 'f' },
       out: { type: 'string', short: 'o' },
       help: { type: 'boolean', short: 'h' },
@@ -67,7 +84,7 @@ function main(argv: string[]): number {
 
   const command = positionals[0] ?? 'scan';
   const projectDir = path.resolve(values.project ?? process.cwd());
-  if (!['scan', 'ios', 'report', 'play', 'check', 'audit'].includes(command)) {
+  if (!['init', 'scan', 'ios', 'report', 'play', 'check', 'audit', 'snapshot', 'diff'].includes(command)) {
     console.error(`Unknown command "${command}".\n\n${HELP}`);
     return 2;
   }
@@ -77,11 +94,45 @@ function main(argv: string[]): number {
   const apis = toApiUsages(analysis);
 
   switch (command) {
+    case 'init': {
+      const plan = planInit(projectDir, scan, analysis, VERSION);
+      const write = !!values.write;
+      print(c.bold('rn-privacy init') + c.dim(`  (${scan.projectType})`) + '\n');
+      const mark = { create: c.green('+'), update: c.green('~'), done: c.dim('✓'), manual: c.yellow('!') };
+      const width = Math.min(44, Math.max(...plan.steps.map((s) => s.file.length)));
+      for (const step of plan.steps) {
+        const line = `  ${mark[step.status]} ${step.file.padEnd(width)}  ${step.status === 'done' ? c.dim(step.what) : step.what}`;
+        print(line);
+        if (step.todo) print(c.yellow(`    ${step.todo}`));
+      }
+      const pending = plan.steps.filter((s) => s.status === 'create' || s.status === 'update');
+      if (!write) {
+        print(pending.length ? c.dim(`\nDry run. Run \`rn-privacy init --write\` to ${pending.length === 1 ? 'make this change' : `make these ${pending.length} changes`}.`) : c.green('\nAlready set up.'));
+        return 0;
+      }
+      const written = applyInit(plan);
+      if (written.length) print(c.green(`\nWrote ${written.length} file${written.length === 1 ? '' : 's'}. Commit ${written.length === 1 ? 'it' : 'them'}.`));
+      else print(c.green('\nAlready set up.'));
+      if (plan.next.length) {
+        print(c.bold('\nNext'));
+        for (const n of plan.next) print(`  ${n}`);
+      }
+      return 0;
+    }
+
     case 'scan':
       return print(values.format === 'json' ? JSON.stringify(toJson(scan, analysis), null, 2) : formatScan(scan, analysis));
 
     case 'report': {
-      const text = values.format === 'json' ? JSON.stringify(toJson(scan, analysis), null, 2) : formatMarkdown(scan, analysis);
+      const format = values.format ?? 'md';
+      if (!['md', 'json', 'appstore', 'inventory'].includes(format)) {
+        console.error(`Unknown format "${format}" for report. Use md, json, appstore or inventory.`);
+        return 2;
+      }
+      const text = format === 'json' ? JSON.stringify(toJson(scan, analysis), null, 2)
+        : format === 'appstore' ? formatAppStore(scan, analysis, !!values['include-conditional']).trimEnd()
+        : format === 'inventory' ? formatInventory(scan, analysis).trimEnd()
+        : formatMarkdown(scan, analysis);
       if (values.out) {
         fs.writeFileSync(path.resolve(values.out), text + '\n');
         return print(c.green(`Wrote ${values.out}`));
@@ -160,7 +211,7 @@ function main(argv: string[]): number {
         console.error(c.red(`File not found: ${csvPath}`));
         return 1;
       }
-      const collected = toCollected(analysis, !!values['include-conditional']);
+      const collected = toPlayCollected(analysis, !!values['include-conditional']);
       const result = fillPlayCsv(fs.readFileSync(input, 'utf8'), collected);
 
       print(c.bold('Google Play Data safety'));
@@ -172,10 +223,16 @@ function main(argv: string[]): number {
         for (const m of result.missingRows) print(c.yellow(`  ! ${m}`));
       }
       print(c.bold('\nStill to answer in Play Console'));
+      if (result.purposeTodo.length) print(`  - Why is it collected? The SDK vendor does not say for: ${result.purposeTodo.join(', ')}`);
       if (result.todo.length) print(`  - Required or optional for users? (${result.todo.join(', ')})`);
-      if (analysis.data.some((d) => d.tracking || d.purposes.includes('third-party-advertising'))) {
+      const sharing = analysis.play.filter((d) => d.shared).flatMap((d) => d.packages);
+      if (sharing.length) print(`  - Shared: marked where the SDK's vendor says so (${[...new Set(sharing)].join(', ')}). Check the others in \`rn-privacy report\`.`);
+      else if (analysis.data.some((d) => d.tracking || d.purposes.includes('third-party-advertising'))) {
         print('  - Shared? Ad and attribution SDKs may use data for their own purposes, which counts as sharing. Check the vendor pages in `rn-privacy report`.');
       }
+      const adId = analysis.android.find((p) => p.permission === AD_ID);
+      if (adId) print(`  - Advertising ID: your app uses it (from ${adId.sources.join(', ')}). Answer Yes in App content > Advertising ID.`);
+      for (const p of analysis.android.filter((x) => x.permission !== AD_ID && x.note)) print(`  - ${p.label}: ${p.note}`);
       print('  - Encrypted in transit? Can users request deletion?');
       print('  - Anything your own code or server collects.');
 
@@ -188,8 +245,46 @@ function main(argv: string[]): number {
       return 0;
     }
 
+    case 'snapshot': {
+      const file = path.resolve(projectDir, values.out ?? SNAPSHOT_FILE);
+      const text = snapshotText(buildSnapshot(scan, analysis));
+      const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+      fs.writeFileSync(file, text);
+      const rel = path.relative(process.cwd(), file) || file;
+      return print(before === text ? c.green(`${rel} is up to date.`) : c.green(`${before === null ? 'Wrote' : 'Updated'} ${rel}. Commit it so pull requests show privacy changes.`));
+    }
+
+    case 'diff': {
+      const base = loadBaseSnapshot(projectDir, values.base);
+      if (!base.snapshot) {
+        console.error(c.red(`✗ ${base.error}`));
+        return 1;
+      }
+      const result = diffSnapshots(base.snapshot, buildSnapshot(scan, analysis));
+      print(values.format === 'json' ? JSON.stringify({ against: base.label, changes: changeCount(result), ...result }, null, 2) : formatDiff(result, base.label, c));
+      return values.strict && changeCount(result) ? 1 : 0;
+    }
+
     case 'audit': {
       const result = audit(scan);
+      if (values.suggest) {
+        const suggestions = suggestFixes(scan);
+        if (!suggestions.length) return print(c.green('✓ No library needs a fix.'));
+        const outDir = path.resolve(projectDir, values.out ?? 'rn-privacy-suggestions');
+        print(c.bold(`Suggested fixes for ${suggestions.length} librar${suggestions.length === 1 ? 'y' : 'ies'}`) + c.dim(`  (${path.relative(process.cwd(), outDir) || outDir})`) + '\n');
+        for (const sug of suggestions) {
+          const dir = path.join(outDir, sug.pkg.replace(/^@/, '').replace(/[/\\ ()]+/g, '-').replace(/-+$/, ''));
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, 'PrivacyInfo.xcprivacy'), suggestionManifest(sug));
+          const issue = suggestionIssue(sug);
+          fs.writeFileSync(path.join(dir, 'ISSUE.md'), `# ${issue.title}\n\n${issue.body}`);
+          print(`  ${c.bold(sug.pkg)}  ${c.dim(`${sug.changes.length} change(s), ${sug.decide.length} to decide`)}`);
+          print(c.dim(`    ${path.relative(process.cwd(), dir)}/PrivacyInfo.xcprivacy  → goes to ${sug.manifestPath} in the library`));
+          print(c.dim(`    ${path.relative(process.cwd(), dir)}/ISSUE.md`) + (sug.issuesUrl ? c.dim(`  → post at ${sug.issuesUrl}`) : ''));
+        }
+        print('\n' + c.dim('Review each file before posting: static analysis can be wrong.'));
+        return 0;
+      }
       print(values.format === 'json' ? JSON.stringify(result, null, 2) : formatAudit(result));
       return values.strict && auditProblemCount(result) ? 1 : 0;
     }

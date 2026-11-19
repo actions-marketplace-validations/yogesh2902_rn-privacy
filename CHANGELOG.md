@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.4.0
+- **10 more SDK rules**, each from the vendor's own source: CleverTap, Braze, Klaviyo, Adjust, Singular and
+  Intercom (from the privacy manifests they publish), MoEngage (manifests and docs), Microsoft Clarity,
+  LogRocket and Luciq/Instabug (vendor docs; what the docs leave out is stated in the rule's notes).
+- **Prebuilt binaries are scanned.** Closed-source SDKs (`.xcframework`, `.framework`, `.a`) in node_modules and
+  `ios/Pods` are searched for the exact symbol names of the required reason APIs. Works on Linux CI too.
+- **Android permissions.** `scan`, `report`, `play` and JSON list sensitive permissions from library manifests,
+  your app's manifest, `expo.android.permissions` and the merged manifest of your last build, minus those you
+  remove. `play` reminds you of the Advertising ID declaration.
+- **`snapshot` and `diff`:** commit `privacy-snapshot.json`, and `diff` shows new APIs, data, tracking domains,
+  permissions and library versions. `--base <git ref>`, `--strict`, `--format json`. The GitHub Action shows the
+  diff in the job summary.
+- **`audit --suggest`:** for each library with a problem, a corrected `PrivacyInfo.xcprivacy` (it passes
+  validation) and a ready-to-post `ISSUE.md` with the findings, evidence and Apple's lists. Nothing is guessed:
+  open questions are listed for the maintainer.
+- **Pull request comments:** the GitHub Action posts the result and the privacy diff as one comment per app,
+  updated on every push, only when the check fails or something changed. New outputs `privacy-changes` and
+  `comment-id`.
+- **pnpm and monorepos:** verified with real pnpm installs (including transitive Expo modules) and npm workspaces
+  with hoisted dependencies. Yarn Plug'n'Play gets one clear message (React Native needs `nodeLinker: node-modules`).
+- **Android data collection for SDKs:** rules can describe the Android SDK from the vendor's Google Play Data
+  safety disclosure, with Play's purposes (including Fraud prevention and Developer communications) and whether
+  the data is shared. Added for Firebase (Analytics, Crashlytics, Messaging, Performance, Auth), AdMob, AppsFlyer,
+  Adjust, Branch, OneSignal, RevenueCat, Braze, CleverTap and MoEngage. `report` gets a Shared column and marks
+  answers derived from iOS with †; `play` ticks "shared" and the sharing purposes, and leaves purposes the vendor
+  does not state for you to choose.
+- **`rn-privacy init`:** one command sets a project up: the Expo plugin in `app.json` (or the privacy manifest in a
+  bare app), `rn-privacy.config.json`, `privacy-snapshot.json` and a GitHub workflow for your package manager
+  (npm, Yarn, pnpm, Bun) and monorepo layout. Dry run unless `--write`; it never overwrites a file.
+- **`report --format appstore`:** the App Privacy answers in the order App Store Connect asks for them, with the
+  library behind each "linked" and "tracking" Yes.
+- **`report --format inventory`:** the data the app collects, why, and which services receive it, in plain words,
+  for whoever writes the privacy policy.
+- **Rule freshness:** a weekly workflow compares the newest privacy manifests SDK vendors publish with a baseline
+  and checks the vendor links, and opens an issue when a rule needs a review.
+- **Your own rules in `rn-privacy.config.json`:** describe in-house or private SDKs (npm packages, CocoaPods pods
+  or Swift packages), replace a built-in rule, or declare data your app itself collects (a rule without
+  `packages`). The file is checked strictly, with a fix for each problem, and `config.schema.json` gives editors
+  autocomplete. Rules that match no installed package are reported.
+- **Swift Package Manager:** packages added in Xcode are read from `Package.resolved` (formats 1 to 3) and scanned
+  from `ios/SourcePackages`, `ios/build/SourcePackages` or Xcode's DerivedData: privacy manifests, source code and
+  binary targets. `audit` covers them and links their issue trackers, and the snapshot records their versions.
+  Packages that are not downloaded yet are named in a warning.
+- **Play disclosures for BugSnag, Microsoft Clarity, Singular and Luciq.** The other SDKs without one were checked:
+  their vendors publish no Play Data safety guidance, so their answers stay derived from iOS (marked †).
+- CocoaPods pods and Swift packages no longer add iOS-only data to the Google Play answers.
+- **Releases publish from GitHub** with npm trusted publishing, so packages carry a provenance statement
+  (see RELEASING.md).
+- SDK tracking domains are normalized to domain names (Adjust lists URLs). The CLI reads its version from
+  package.json.
+
 ## 0.3.0
 - **`rn-privacy audit`:** checks the privacy manifests your libraries ship. It finds invalid manifests (made-up
   data types, empty purposes, unreadable files), libraries that use required reason APIs without a manifest,
